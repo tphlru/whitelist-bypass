@@ -17,12 +17,13 @@ cd "$(dirname "$0")/relay"
 echo "Building gomobile .aar..."
 gomobile bind -v -target=android -androidapi 23 -o mobile.aar ./mobile/ 2>&1
 
-echo "Copying .aar to app/libs..."
-mkdir -p ../app/app/libs
-cp mobile.aar ../app/app/libs/mobile.aar
+echo "Copying .aar to android-app/libs..."
+mkdir -p ../android-app/app/libs
+cp mobile.aar ../android-app/app/libs/mobile.aar
 
-echo "Copying hook.js to assets..."
-mkdir -p ../app/app/src/main/assets
-cp ../hook.js ../app/app/src/main/assets/hook.js
+echo "Copying hooks to assets..."
+mkdir -p ../android-app/app/src/main/assets
+cp ../hooks/joiner-vk.js ../android-app/app/src/main/assets/joiner-vk.js
+cp ../hooks/joiner-telemost.js ../android-app/app/src/main/assets/joiner-telemost.js
 
 echo "Done. .aar size: $(du -h mobile.aar | cut -f1)"

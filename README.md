@@ -1,13 +1,16 @@
 # Whitelist Bypass
 
-Tunnels internet traffic through VK call DataChannels to bypass government whitelist censorship.
+Tunnels internet traffic through video calling platforms (VK Call, Yandex Telemost) to bypass government whitelist censorship.
 
 ## How it works
 
-VK calls use WebRTC with an SFU (Selective Forwarding Unit). The SFU forwards all SCTP data channels between participants without inspecting them. This tool creates a custom DataChannel (id:2) alongside VK's built-in animoji channel (id:1) and uses it as a bidirectional data pipe.
+Video calling platforms use WebRTC with an SFU (Selective Forwarding Unit). The SFU forwards SCTP data channels between participants without inspecting them. This tool creates a DataChannel alongside the call's built-in channels and uses it as a bidirectional data pipe.
+
+- **VK Call**: Uses negotiated DataChannel id:2 (alongside VK's animoji channel id:1)
+- **Telemost**: Uses non-negotiated DataChannel labeled "sharing" (matching real screen sharing traffic), with SDP renegotiation via signaling WebSocket
 
 ```
-Joiner (censored)                         Creator (free internet)
+Joiner (censored, Android)                Creator (free internet, desktop)
 
 All apps
   |
@@ -19,9 +22,9 @@ SOCKS5 proxy (Go, :1080)
   |
 WebSocket (:9000)
   |
-WebView (VK call)                         Browser (VK call)
+WebView (call page)                       Electron (call page)
   |                                         |
-DataChannel id:2  <--- VK SFU --->  DataChannel id:2
+DataChannel  <------- SFU ------->  DataChannel
                                             |
                                         WebSocket (:9000)
                                             |
@@ -30,70 +33,90 @@ DataChannel id:2  <--- VK SFU --->  DataChannel id:2
                                         Internet
 ```
 
-Traffic goes through VK's TURN servers (155.212.x.x:19302) which are whitelisted. To the network firewall it looks like a normal VK call.
+Traffic goes through the platform's TURN servers which are whitelisted. To the network firewall it looks like a normal video call.
 
 ## Components
 
-- `hook.js` - Injected into VK call page on both sides. Hooks RTCPeerConnection, creates tunnel DataChannel, bridges to local WebSocket.
-- `relay/` - Go binary and gomobile library. SOCKS5 proxy + WebSocket server + tun2socks.
-- `app/` - Android app. WebView + VpnService + Go relay (.aar).
+- `hooks/` - JavaScript hooks injected into call pages. Separate hooks per platform and role:
+  - `joiner-vk.js`, `creator-vk.js` - VK Call hooks
+  - `joiner-telemost.js`, `creator-telemost.js` - Telemost hooks
+  - Hooks intercept RTCPeerConnection, create tunnel DataChannel, bridge to local WebSocket
+  - Telemost hooks include fake media (camera/mic), message chunking (994B payload, 1000B total), and SDP renegotiation
+- `relay/` - Go relay binary and gomobile library
+  - SOCKS5 proxy with TCP CONNECT and UDP ASSOCIATE
+  - WebSocket server for browser-relay communication
+  - tun2socks (Android only, via build tags)
+  - Binary framing protocol: `[4B connID][1B msgType][payload]`
+- `android-app/` - Android joiner app
+  - WebView loading call page with hook injection
+  - VpnService capturing all device traffic
+  - Go relay as .aar library (gomobile)
+- `creator-app/` - Electron desktop creator app
+  - Webview with persistent session for login retention
+  - CSP header stripping for localhost WebSocket access
+  - Auto-permission granting (camera/mic)
+  - Go relay spawned as child process
+  - Log panels for relay and hook output
+
+## Prebuilt binaries
+
+Run `./build-creator.sh` and `./build-app.sh` to produce binaries in `prebuilts/`:
+
+| File | Platform |
+|---|---|
+| `WhitelistBypass Creator-*-arm64.dmg` | macOS |
+| `WhitelistBypass Creator-*-x64.exe` | Windows x64 |
+| `WhitelistBypass Creator-*-ia32.exe` | Windows x86 |
+| `WhitelistBypass Creator-*.AppImage` | Linux x64 |
+| `whitelist-bypass.apk` | Android |
 
 ## Setup
 
-### Creator side (free internet, PC)
+### Creator side (free internet, desktop)
 
-1. Build the relay:
-```
-cd relay
-go build -o relay .
-```
+Install and run the Electron app from `prebuilts/`. It bundles the Go relay automatically.
 
-2. Start it:
-```
-./relay --mode creator
-```
-
-3. Open Chrome, go to Sources -> Snippets, create snippet with contents of `hook.js`, run it.
-
-4. Create a VK call, copy the join link, send it to the joiner.
+1. Open the app
+2. Click "VK Call" or "Telemost"
+3. Log in, create a call
+4. Copy the join link, send it to the joiner
 
 ### Joiner side (censored, Android)
 
-1. Build the Go library:
-```
-./build-go.sh
-```
+1. Install `whitelist-bypass.apk` from `prebuilts/`
+2. Paste the call link in the app
+3. The app joins the call, establishes the tunnel, starts VPN
+4. All device traffic flows through the call
 
-2. Build the APK:
-```
-./build-app.sh
-```
+## Building from source
 
-3. Install `whitelist-bypass.apk` on the phone.
-
-4. Set the VK call link in `MainActivity.kt` (`VK_CALL_LINK` constant) or paste it in the app.
-
-5. The app joins the call, establishes the tunnel, starts VPN. All device traffic flows through the VK call.
-
-### Joiner side (censored, PC)
-
-1. Start the relay:
-```
-./relay --mode joiner
-```
-
-2. Open Chrome, go to Sources -> Snippets, create snippet with contents of `hook.js`, run it.
-
-3. Navigate to the VK call link.
-
-4. Wait for `=== CALL CONNECTED ===` and `WebSocket connected to Go relay`.
-
-5. Set system proxy to `socks5://127.0.0.1:1080`.
-
-## Build requirements
+### Requirements
 
 - Go 1.21+
 - gomobile (`go install golang.org/x/mobile/cmd/gomobile@latest`)
 - gobind (`go install golang.org/x/mobile/cmd/gobind@latest`)
-- Android SDK + NDK 28+
+- Android SDK + NDK 29
 - Java 11+
+- Node.js 18+
+
+### Build scripts
+
+```sh
+# Build Go .aar for Android (includes hooks copy)
+./build-go.sh
+
+# Build Android APK -> prebuilts/whitelist-bypass.apk
+./build-app.sh
+
+# Build Electron apps for all platforms -> prebuilts/
+./build-creator.sh
+```
+
+### Relay cross-compilation
+
+The Go relay is split into platform-specific files:
+- `relay/mobile/mobile.go` - Shared networking code (SOCKS5, WebSocket, framing)
+- `relay/mobile/tun_android.go` - Android-only: tun2socks + fdsan fix (CGo)
+- `relay/mobile/tun_stub.go` - Desktop stub (no tun2socks needed)
+
+This allows cross-compiling the relay for macOS/Windows/Linux without CGo or Android NDK.

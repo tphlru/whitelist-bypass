@@ -7,12 +7,11 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/xjasonlyu/tun2socks/v2/engine"
 )
 
 const (
@@ -21,9 +20,12 @@ const (
 	msgConnectErr byte = 0x03
 	msgData       byte = 0x04
 	msgClose      byte = 0x05
+	msgUDP        byte = 0x06
+	msgUDPReply   byte = 0x07
 )
 
 const readBufSize = 65536
+
 
 var framePool = sync.Pool{
 	New: func() any {
@@ -63,31 +65,13 @@ var logCb LogCallback
 
 func logMsg(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
-	log.Print(msg)
 	if logCb != nil {
 		logCb.OnLog(msg)
+	} else {
+		log.Print(msg)
 	}
 }
 
-func StartTun2Socks(fd, mtu, socksPort int) error {
-	proxy := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
-	logMsg("tun2socks: starting fd=%d mtu=%d proxy=%s", fd, mtu, proxy)
-	os.Setenv("TUN2SOCKS_LOG_LEVEL", "info")
-	key := &engine.Key{
-		Proxy:  proxy,
-		Device: fmt.Sprintf("fd://%d", fd),
-		MTU:    mtu,
-	}
-	engine.Insert(key)
-	engine.Start()
-	logMsg("tun2socks: running")
-	return nil
-}
-
-func StopTun2Socks() {
-	engine.Stop()
-	logMsg("tun2socks: stopped")
-}
 
 type wsWriter struct {
 	ws   *websocket.Conn
@@ -129,6 +113,7 @@ func (w *wsWriter) close() {
 	<-w.done
 }
 
+
 func StartJoiner(wsPort, socksPort int, cb LogCallback) error {
 	logCb = cb
 	j := &joinerRelay{
@@ -137,6 +122,7 @@ func StartJoiner(wsPort, socksPort int, cb LogCallback) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", j.handleWS)
+
 	go func() {
 		addr := fmt.Sprintf("127.0.0.1:%d", wsPort)
 		logMsg("joiner: WebSocket on %s", addr)
@@ -156,17 +142,19 @@ func StartCreator(wsPort int, cb LogCallback) error {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", c.handleWS)
+
 	addr := fmt.Sprintf("127.0.0.1:%d", wsPort)
 	logMsg("creator: WebSocket on %s", addr)
 	return http.ListenAndServe(addr, mux)
 }
 
 type joinerRelay struct {
-	writer *wsWriter
-	conns  sync.Map
-	nextID atomic.Uint32
-	ready  chan struct{}
-	once   sync.Once
+	writer     *wsWriter
+	conns      sync.Map
+	udpClients sync.Map
+	nextID     atomic.Uint32
+	ready      chan struct{}
+	once       sync.Once
 }
 
 type socksConn struct {
@@ -174,6 +162,96 @@ type socksConn struct {
 	conn net.Conn
 	j    *joinerRelay
 	rdy  chan error
+}
+
+type udpClient struct {
+	udpConn     *net.UDPConn
+	clientAddr  *net.UDPAddr
+	socksHeader []byte
+}
+
+func (j *joinerRelay) handleUDPAssociate(tcpConn net.Conn) {
+	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
+	if err != nil {
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		tcpConn.Close()
+		return
+	}
+	udpConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		tcpConn.Close()
+		return
+	}
+	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
+	reply := []byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0}
+	binary.BigEndian.PutUint16(reply[8:10], uint16(localAddr.Port))
+	tcpConn.Write(reply)
+	logMsg("joiner: UDP ASSOCIATE on port %d", localAddr.Port)
+
+	go func() {
+		buf := make([]byte, 1)
+		tcpConn.Read(buf)
+		udpConn.Close()
+	}()
+
+	go func() {
+		defer udpConn.Close()
+		defer tcpConn.Close()
+		buf := make([]byte, readBufSize)
+		var clientAddr *net.UDPAddr
+		for {
+			n, addr, err := udpConn.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			if n < 10 {
+				continue
+			}
+			clientAddr = addr
+			frag := buf[2]
+			if frag != 0 {
+				continue
+			}
+			atyp := buf[3]
+			var dstAddr string
+			var headerLen int
+			switch atyp {
+			case 0x01:
+				if n < 10 {
+					continue
+				}
+				dstAddr = fmt.Sprintf("%d.%d.%d.%d:%d", buf[4], buf[5], buf[6], buf[7],
+					binary.BigEndian.Uint16(buf[8:10]))
+				headerLen = 10
+			case 0x03:
+				dlen := int(buf[4])
+				if n < 5+dlen+2 {
+					continue
+				}
+				dstAddr = fmt.Sprintf("%s:%d", string(buf[5:5+dlen]),
+					binary.BigEndian.Uint16(buf[5+dlen:7+dlen]))
+				headerLen = 5 + dlen + 2
+			case 0x04:
+				if n < 22 {
+					continue
+				}
+				ip := net.IP(buf[4:20])
+				dstAddr = fmt.Sprintf("[%s]:%d", ip.String(),
+					binary.BigEndian.Uint16(buf[20:22]))
+				headerLen = 22
+			default:
+				continue
+			}
+			id := j.nextID.Add(1)
+			payload := make([]byte, len(dstAddr)+1+n-headerLen)
+			payload[0] = byte(len(dstAddr))
+			copy(payload[1:], dstAddr)
+			copy(payload[1+len(dstAddr):], buf[headerLen:n])
+			j.udpClients.Store(id, &udpClient{udpConn: udpConn, clientAddr: clientAddr, socksHeader: buf[:headerLen]})
+			j.send(id, msgUDP, payload)
+		}
+	}()
 }
 
 func (j *joinerRelay) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -199,6 +277,19 @@ func (j *joinerRelay) handleWS(w http.ResponseWriter, r *http.Request) {
 func (j *joinerRelay) handleMessage(connID uint32, msgType byte, payload []byte) {
 	val, ok := j.conns.Load(connID)
 	if !ok {
+		return
+	}
+	if msgType == msgUDPReply {
+		uval, ok := j.udpClients.Load(connID)
+		if !ok {
+			return
+		}
+		uc := uval.(*udpClient)
+		reply := make([]byte, len(uc.socksHeader)+len(payload))
+		copy(reply, uc.socksHeader)
+		copy(reply[len(uc.socksHeader):], payload)
+		uc.udpConn.WriteToUDP(reply, uc.clientAddr)
+		j.udpClients.Delete(connID)
 		return
 	}
 	sc := val.(*socksConn)
@@ -252,7 +343,17 @@ func (j *joinerRelay) handleSOCKS(conn net.Conn) {
 	}
 	conn.Write([]byte{0x05, 0x00})
 	n, err = conn.Read(buf)
-	if err != nil || n < 7 || buf[0] != 0x05 || buf[1] != 0x01 {
+	if err != nil || n < 7 || buf[0] != 0x05 {
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		conn.Close()
+		return
+	}
+	cmd := buf[1]
+	if cmd == 0x03 {
+		j.handleUDPAssociate(conn)
+		return
+	}
+	if cmd != 0x01 {
 		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		conn.Close()
 		return
@@ -345,6 +446,8 @@ func (c *creatorRelay) handleMessage(connID uint32, msgType byte, payload []byte
 	switch msgType {
 	case msgConnect:
 		go c.connect(connID, string(payload))
+	case msgUDP:
+		go c.handleUDP(connID, payload)
 	case msgData:
 		val, ok := c.conns.Load(connID)
 		if ok {
@@ -368,6 +471,41 @@ func (c *creatorRelay) send(connID uint32, msgType byte, payload []byte) {
 	n := encodeFrameInto(buf, connID, msgType, payload)
 	w.send(buf[:n])
 	framePool.Put(bufp)
+}
+
+func (c *creatorRelay) handleUDP(connID uint32, payload []byte) {
+	if len(payload) < 2 {
+		return
+	}
+	addrLen := int(payload[0])
+	if len(payload) < 1+addrLen {
+		return
+	}
+	addr := string(payload[1 : 1+addrLen])
+	data := payload[1+addrLen:]
+
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		logMsg("creator: UDP resolve %s failed: %v", addr, err)
+		return
+	}
+	conn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		logMsg("creator: UDP dial %s failed: %v", addr, err)
+		return
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, err = conn.Write(data)
+	if err != nil {
+		return
+	}
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return
+	}
+	c.send(connID, msgUDPReply, buf[:n])
 }
 
 func (c *creatorRelay) connect(connID uint32, addr string) {

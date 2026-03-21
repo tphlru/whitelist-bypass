@@ -1,0 +1,46 @@
+{
+  "name": "whitelist-bypass-creator",
+  "version": "0.1.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.0.0"
+  },
+  "build": {
+    "appId": "whitelist.bypass.creator",
+    "productName": "WhitelistBypass Creator",
+    "directories": {
+      "output": "../prebuilts"
+    },
+    "extraResources": [
+      { "from": "../hooks/creator-vk.js", "to": "hooks/creator-vk.js" },
+      { "from": "../hooks/creator-telemost.js", "to": "hooks/creator-telemost.js" }
+    ],
+    "mac": {
+      "target": "dmg",
+      "icon": "resources/icon.icns",
+      "extraResources": [
+        { "from": "../relay/relay-darwin", "to": "relay" }
+      ]
+    },
+    "win": {
+      "target": "portable",
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "icon": "resources/icon.ico",
+      "extraResources": [
+        { "from": "../relay/relay-bundle.exe", "to": "relay.exe" }
+      ]
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "resources/icon.png",
+      "extraResources": [
+        { "from": "../relay/relay-bundle", "to": "relay" }
+      ]
+    }
+  }
+}

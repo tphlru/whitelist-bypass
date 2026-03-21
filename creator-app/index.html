@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, sans-serif; background: #1a1a1a; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+.toolbar { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #222; border-bottom: 1px solid #333; height: 40px; flex-shrink: 0; }
+.toolbar button { padding: 4px 14px; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; font-weight: 500; }
+.btn-home { background: #444; color: #e0e0e0; }
+.btn-vk { background: #0077ff; color: white; }
+.btn-telemost { background: #fc3f1d; color: white; }
+.btn-inject { background: #f59e0b; color: black; }
+.link-text { font-family: monospace; font-size: 12px; color: #aaa; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.content { flex: 1; position: relative; }
+.content webview { width: 100%; height: 100%; border: none; }
+.welcome { display: flex; align-items: center; justify-content: center; height: 100%; flex-direction: column; gap: 16px; }
+.welcome h1 { font-size: 22px; font-weight: 500; }
+.welcome p { color: #888; font-size: 14px; }
+.logs { display: flex; gap: 0; border-top: 1px solid #333; height: 140px; flex-shrink: 0; }
+.log-panel { flex: 1; display: flex; flex-direction: column; }
+.log-panel:first-child { border-right: 1px solid #333; }
+.log-title { font-size: 11px; font-weight: 600; color: #888; padding: 4px 8px; background: #1e1e1e; border-bottom: 1px solid #333; }
+.log-content { flex: 1; overflow-y: auto; padding: 4px 8px; font-family: monospace; font-size: 11px; background: #111; white-space: pre-wrap; word-break: break-all; }
+.log-content.relay { color: #4fc3f7; }
+.log-content.hook { color: #66bb6a; }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <button class="btn-home" onclick="goHome()">Home</button>
+  <button class="btn-vk" onclick="loadURL('https://vk.com/im')">VK Call</button>
+  <button class="btn-telemost" onclick="loadURL('https://telemost.yandex.ru/')">Telemost</button>
+</div>
+<div class="content" id="content">
+  <div class="welcome" id="welcome">
+    <h1>Whitelist Bypass - Creator</h1>
+    <p>Click VK Call or Telemost to start</p>
+  </div>
+</div>
+<div class="logs">
+  <div class="log-panel">
+    <div class="log-title">Relay <span onclick="copyLog('relayLog')" style="cursor:pointer;float:right;margin-left:6px" title="Copy"><img src="resources/icons8-copy-50.png" style="height:16px;vertical-align:middle;filter:invert(1) brightness(2);padding:0 4px"></span><span onclick="saveLogs()" style="cursor:pointer;float:right;margin-left:6px" title="Save all"><img src="resources/icons8-download-64.png" style="height:19px;vertical-align:middle;filter:invert(1) brightness(2);padding:0 4px"></span><span onclick="document.getElementById('relayLog').textContent=''" style="cursor:pointer;float:right" title="Clear"><span style="font-size:16px;line-height:16px">&#x2715;</span></span></div>
+    <div class="log-content relay" id="relayLog"></div>
+  </div>
+  <div class="log-panel">
+    <div class="log-title">Hook <span onclick="copyLog('hookLog')" style="cursor:pointer;float:right;margin-left:6px" title="Copy"><img src="resources/icons8-copy-50.png" style="height:16px;vertical-align:middle;filter:invert(1) brightness(2);padding:0 4px"></span><span onclick="saveLogs()" style="cursor:pointer;float:right;margin-left:6px" title="Save all"><img src="resources/icons8-download-64.png" style="height:19px;vertical-align:middle;filter:invert(1) brightness(2);padding:0 4px"></span><span onclick="document.getElementById('hookLog').textContent=''" style="cursor:pointer;float:right" title="Clear"><span style="font-size:16px;line-height:16px">&#x2715;</span></span></div>
+    <div class="log-content hook" id="hookLog"></div>
+  </div>
+</div>
+<script>
+var wv = null;
+
+function copyLog(id) {
+  navigator.clipboard.writeText(document.getElementById(id).textContent);
+}
+
+function saveLogs() {
+  var relay = document.getElementById('relayLog').textContent;
+  var hook = document.getElementById('hookLog').textContent;
+  var text = '=== RELAY ===\n' + relay + '\n\n=== HOOK ===\n' + hook;
+  var blob = new Blob([text], { type: 'text/plain' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'tunnel-logs-' + new Date().toISOString().replace(/[:.]/g, '-') + '.txt';
+  a.click();
+}
+
+function appendHookLog(msg) {
+  var el = document.getElementById('hookLog');
+  if (el.textContent.length > 0) el.textContent += '\n';
+  el.textContent += msg.replace('[HOOK] ', '');
+  el.scrollTop = el.scrollHeight;
+}
+
+function goHome() {
+  if (wv) { wv.remove(); wv = null; }
+  document.getElementById('welcome').style.display = 'flex';
+}
+
+function injectHook() {
+  if (!wv) return;
+  var url = wv.getURL();
+  window.bridge.getHookCode(url).then(function(code) {
+    wv.executeJavaScript(code).catch(function(e) {
+      appendHookLog('Inject error: ' + e.message);
+    });
+  });
+}
+
+function loadURL(url) {
+  document.getElementById('welcome').style.display = 'none';
+  if (wv) wv.remove();
+
+  wv = document.createElement('webview');
+  wv.setAttribute('src', url);
+  wv.setAttribute('partition', 'persist:creator');
+  wv.setAttribute('preload', './call-preload.js');
+  wv.setAttribute('nodeintegration', '');
+  wv.setAttribute('nodeintegrationinsubframes', '');
+  wv.style.width = '100%';
+  wv.style.height = '100%';
+  document.getElementById('content').appendChild(wv);
+  wv.addEventListener('dom-ready', function() { wv.setAudioMuted(true); });
+
+  // Inject hook on first load
+  wv.addEventListener('did-finish-load', function() {
+    injectHook();
+  }, { once: true });
+
+}
+
+
+// Poll hook logs from webview
+setInterval(function() {
+  if (!wv) return;
+  wv.executeJavaScript('(window.__hookLogs && window.__hookLogs.length) ? window.__hookLogs.splice(0) : []')
+    .then(function(logs) {
+      logs.forEach(function(msg) { appendHookLog(msg); });
+    }).catch(function() {});
+}, 500);
+
+window.bridge.onRelayLog(function(msg) {
+  var el = document.getElementById('relayLog');
+  if (el.textContent.length > 0) el.textContent += '\n';
+  el.textContent += msg;
+  el.scrollTop = el.scrollHeight;
+});
+</script>
+</body>
+</html>
