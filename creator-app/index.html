@@ -61,6 +61,7 @@ body { font-family: -apple-system, sans-serif; background: #1a1a1a; color: #e0e0
     <div class="tab-add" onclick="addTab()" title="New tab">+</div>
   </div>
   <div class="tab-bar-actions">
+    <div class="tab-settings" onclick="copyCookies()" title="Save VK cookies to cookies.json for headless mode" style="cursor:pointer">Save Cookies</div>
     <div class="tab-settings" onclick="openSettings()" title="Settings">Settings</div>
     <div class="tab-bot" id="tabBot" onclick="toggleBot()">Bot: Off</div>
   </div>
@@ -133,6 +134,21 @@ window.bridge.onBotError(function(msg) {
   btn.textContent = 'Bot: Off';
   btn.classList.remove('running');
 });
+
+function copyCookies() {
+  window.bridge.getCookies('.vk.com').then(function(cookies) {
+    if (!cookies.length) {
+      showError('No VK cookies found.\nPlease log into VK first.');
+      return;
+    }
+    var simple = cookies.map(function(c) { return { name: c.name, value: c.value }; });
+    var blob = new Blob([JSON.stringify(simple, null, 2)], { type: 'application/json' });
+    var link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'cookies.json';
+    link.click();
+  });
+}
 
 var tabsState = {}; // tabId -> { wv, mode, relayLogs, hookLogs }
 var activeTabId = null;
