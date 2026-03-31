@@ -279,6 +279,17 @@ ipcMain.handle('stop-bot', function() {
   return { success: true };
 });
 
+ipcMain.handle('get-cookies', async function(e, domain) {
+  var ses = session.fromPartition('persist:creator');
+  var all = await ses.cookies.get({});
+  var vkCookies = all.filter(function(c) {
+    return c.domain && (c.domain.indexOf('vk.com') !== -1 || c.domain.indexOf('vk.ru') !== -1);
+  });
+  console.log('[COOKIES] total:', all.length, 'vk:', vkCookies.length);
+  return vkCookies;
+});
+
+
 app.whenReady().then(createWindow);
 
 app.on('window-all-closed', function() { killAllRelays(); app.quit(); });

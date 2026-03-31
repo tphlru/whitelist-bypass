@@ -19,6 +19,8 @@ type VKClient struct {
 	remoteSet   bool
 	pending     []webrtc.ICECandidateInit
 	OnConnected func(*VP8DataTunnel)
+	dcProducerNotif *webrtc.DataChannel
+	dcProducerCmd   *webrtc.DataChannel
 }
 
 func NewVKClient(logFn func(string, ...any)) *VKClient {
@@ -105,6 +107,46 @@ func (c *VKClient) handleICEServers(data json.RawMessage) {
 	c.logFn("vk: AddTrack audio: sender=%v err=%v", audioSender != nil, audioErr)
 	c.logFn("vk: AddTrack video: sender=%v err=%v", videoSender != nil, videoErr)
 	c.logFn("vk: senders count: %d", len(pc.GetSenders()))
+
+	// Create DataChannels required by VK SFU.
+	// The SFU sends producer-updated (SDP offer) via producerNotification DC.
+	ordered := true
+	dcNotif, err := pc.CreateDataChannel("producerNotification", &webrtc.DataChannelInit{Ordered: &ordered})
+	if err != nil {
+		c.logFn("vk: failed to create producerNotification DC: %v", err)
+	} else {
+		c.dcProducerNotif = dcNotif
+		dcNotif.OnOpen(func() {
+			c.logFn("vk: producerNotification DC opened")
+		})
+		dcNotif.OnMessage(func(msg webrtc.DataChannelMessage) {
+			c.logFn("vk: producerNotification msg len=%d isString=%v", len(msg.Data), msg.IsString)
+			// Forward to Node bridge as sfu-dc-message
+			c.SendToHook("sfu-dc-message", map[string]interface{}{
+				"channel": "producerNotification",
+				"data":    string(msg.Data),
+			})
+		})
+	}
+	dcCmd, err := pc.CreateDataChannel("producerCommand", &webrtc.DataChannelInit{Ordered: &ordered})
+	if err != nil {
+		c.logFn("vk: failed to create producerCommand DC: %v", err)
+	} else {
+		c.dcProducerCmd = dcCmd
+		dcCmd.OnOpen(func() {
+			c.logFn("vk: producerCommand DC opened")
+		})
+		dcCmd.OnMessage(func(msg webrtc.DataChannelMessage) {
+			c.logFn("vk: producerCommand msg len=%d", len(msg.Data))
+			c.SendToHook("sfu-dc-message", map[string]interface{}{
+				"channel": "producerCommand",
+				"data":    string(msg.Data),
+			})
+		})
+	}
+	// SFU also expects screen share DCs
+	pc.CreateDataChannel("producerScreenShare", &webrtc.DataChannelInit{Ordered: &ordered})
+	pc.CreateDataChannel("consumerScreenShare", &webrtc.DataChannelInit{Ordered: &ordered})
 
 	pc.OnICECandidate(func(cand *webrtc.ICECandidate) {
 		if cand == nil {
