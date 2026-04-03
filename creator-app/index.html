@@ -61,6 +61,7 @@ body { font-family: -apple-system, sans-serif; background: #1a1a1a; color: #e0e0
     <div class="tab-add" onclick="addTab()" title="New tab">+</div>
   </div>
   <div class="tab-bar-actions">
+    <div class="tab-settings" onclick="copyCookies()" title="Save VK cookies to cookies.json for headless mode" style="cursor:pointer">Save Cookies</div>
     <div class="tab-settings" onclick="openSettings()" title="Settings">Settings</div>
     <div class="tab-bot" id="tabBot" onclick="toggleBot()">Bot: Off</div>
   </div>
@@ -102,6 +103,37 @@ body { font-family: -apple-system, sans-serif; background: #1a1a1a; color: #e0e0
     <input type="number" id="vkGroupId" placeholder="123456789">
     <label for="vkUserId">User ID</label>
     <input type="number" id="vkUserId" placeholder="123456789">
+    <div style="margin-bottom:16px">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="autoclickEnabled" style="width:auto;margin:0">
+        <span>Enable autoclick</span>
+      </label>
+    </div>
+    <hr style="border:none;border-top:1px solid #444;margin:16px 0">
+    <h2 style="margin-bottom:16px">API settings</h2>
+    <div style="margin-bottom:16px">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="apiEnabled" style="width:auto;margin:0" onchange="toggleApiSettings()">
+        <span>Enable API server</span>
+      </label>
+    </div>
+    <div id="apiSettingsSection" style="display:none">
+      <label for="apiPort">API Port</label>
+      <input type="number" id="apiPort" placeholder="8080" min="1" max="65535">
+      <div style="margin-bottom:16px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="apiUseSecret" style="width:auto;margin:0" onchange="toggleApiSecret()">
+          <span>Require API secret for access</span>
+        </label>
+      </div>
+      <div id="apiSecretSection" style="display:none">
+        <label for="apiSecret">API Secret</label>
+        <div style="display:flex;gap:8px;margin-bottom:16px">
+          <input type="text" id="apiSecret" placeholder="secret key" style="flex:1">
+          <button onclick="generateApiSecret()" style="padding:8px 12px;border:1px solid #555;border-radius:8px;background:#333;color:#e0e0e0;cursor:pointer;font-size:12px">Generate</button>
+        </div>
+      </div>
+    </div>
     <div class="popup-buttons">
       <button class="btn-cancel" onclick="closeSettings()">Cancel</button>
       <button class="btn-save" onclick="saveSettings()">Save</button>
@@ -134,19 +166,104 @@ window.bridge.onBotError(function(msg) {
   btn.classList.remove('running');
 });
 
+function copyCookies() {
+  window.bridge.getCookies('.vk.com').then(function(cookies) {
+    if (!cookies.length) {
+      showError('No VK cookies found.\nPlease log into VK first.');
+      return;
+    }
+    var simple = cookies.map(function(c) { return { name: c.name, value: c.value }; });
+    var blob = new Blob([JSON.stringify(simple, null, 2)], { type: 'application/json' });
+    var link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'cookies.json';
+    link.click();
+  });
+}
+
 var tabsState = {}; // tabId -> { wv, mode, relayLogs, hookLogs }
 var activeTabId = null;
 var nextTabId = 1;
 var botRunning = false;
 
 var savedSettings = localStorage.getItem('botSettings');
-var botSettings = savedSettings ? JSON.parse(savedSettings) : { token: '', groupId: '', userId: '' };
+var parsedSettings = savedSettings ? JSON.parse(savedSettings) : { 
+  token: '', 
+  groupId: '', 
+  userId: '', 
+  autoclickEnabled: true,
+  apiEnabled: true,
+  apiPort: 8080,
+  apiSecret: '',
+  apiUseSecret: false
+};
+
+var botSettings = { 
+  token: parsedSettings.token,
+  groupId: parsedSettings.groupId,
+  userId: parsedSettings.userId,
+  autoclickEnabled: parsedSettings.autoclickEnabled !== false,
+  apiEnabled: parsedSettings.apiEnabled !== false,
+  apiPort: parsedSettings.apiPort || 8080,
+  apiSecret: parsedSettings.apiSecret || '',
+  apiUseSecret: Boolean(parsedSettings.apiUseSecret)
+};
+
+window.bridge.getEnvVars().then(function(envVars) {
+  if (envVars.apiPort) {
+    botSettings.apiPort = parseInt(envVars.apiPort);
+  }
+  if (envVars.apiKey) {
+    botSettings.apiSecret = envVars.apiKey;
+    botSettings.apiUseSecret = true;
+  }
+  window.bridge.setAutoclickEnabled(botSettings.autoclickEnabled);
+  window.bridge.setApiSettings(botSettings.apiEnabled, botSettings.apiPort, botSettings.apiSecret, botSettings.apiUseSecret);
+  updateSettingsUI();
+});
+
+function updateSettingsUI() {
+  if (document.getElementById('apiPort')) {
+    document.getElementById('apiPort').value = botSettings.apiPort;
+    document.getElementById('apiSecret').value = botSettings.apiSecret;
+    document.getElementById('apiUseSecret').checked = botSettings.apiUseSecret;
+    toggleApiSettings();
+  } else {
+    setTimeout(updateSettingsUI, 50);
+  }
+}
+
+function generateApiSecret() {
+  var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  var secret = '';
+  for (var i = 0; i < 32; i++) {
+    secret += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  document.getElementById('apiSecret').value = secret;
+}
+
+function toggleApiSettings() {
+  var checked = document.getElementById('apiEnabled').checked;
+  document.getElementById('apiSettingsSection').style.display = checked ? 'block' : 'none';
+  if (checked) toggleApiSecret();
+}
+
+function toggleApiSecret() {
+  var checked = document.getElementById('apiUseSecret').checked;
+  document.getElementById('apiSecretSection').style.display = checked ? 'block' : 'none';
+}
 
 function openSettings() {
   document.getElementById('settingsPopup').classList.add('visible');
   document.getElementById('vkToken').value = botSettings.token;
   document.getElementById('vkGroupId').value = botSettings.groupId;
   document.getElementById('vkUserId').value = botSettings.userId;
+  document.getElementById('autoclickEnabled').checked = botSettings.autoclickEnabled !== false;
+  document.getElementById('apiEnabled').checked = botSettings.apiEnabled !== false;
+  document.getElementById('apiPort').value = botSettings.apiPort || 8080;
+  document.getElementById('apiSecret').value = botSettings.apiSecret || '';
+  document.getElementById('apiUseSecret').checked = botSettings.apiUseSecret || false;
+  toggleApiSettings();
 }
 
 function closeSettings() {
@@ -157,7 +274,14 @@ function saveSettings() {
   botSettings.token = document.getElementById('vkToken').value.trim();
   botSettings.groupId = document.getElementById('vkGroupId').value.trim();
   botSettings.userId = document.getElementById('vkUserId').value.trim();
+  botSettings.autoclickEnabled = document.getElementById('autoclickEnabled').checked;
+  botSettings.apiEnabled = document.getElementById('apiEnabled').checked;
+  botSettings.apiPort = parseInt(document.getElementById('apiPort').value) || 8080;
+  botSettings.apiSecret = document.getElementById('apiSecret').value.trim();
+  botSettings.apiUseSecret = document.getElementById('apiUseSecret').checked;
   localStorage.setItem('botSettings', JSON.stringify(botSettings));
+  window.bridge.setAutoclickEnabled(botSettings.autoclickEnabled);
+  window.bridge.setApiSettings(botSettings.apiEnabled, botSettings.apiPort, botSettings.apiSecret, botSettings.apiUseSecret);
   closeSettings();
   console.log('[BOT] Settings saved:', botSettings);
 }
@@ -182,7 +306,7 @@ function toggleBot() {
 
 function addTab() {
   var tabId = 'tab-' + (nextTabId++);
-  tabsState[tabId] = { wv: null, url: '', mode: 'dc', relayLogs: '', hookLogs: '', name: '' };
+  tabsState[tabId] = { wv: null, url: '', mode: 'dc', relayLogs: '', hookLogs: '', name: '', isBot: false };
   window.bridge.startRelay(tabId);
   renderTabs();
   selectTab(tabId);
@@ -262,7 +386,6 @@ function renderContent() {
   var welcome = document.getElementById('welcome');
   var toolbar = document.getElementById('toolbar');
   var logsPanel = document.getElementById('logsPanel');
-  // Hide all webviews
   var wvs = content.querySelectorAll('webview');
   for (var i = 0; i < wvs.length; i++) wvs[i].classList.add('hidden');
 
@@ -300,27 +423,37 @@ function loadURL(url) {
   wv.setAttribute('partition', 'persist:creator');
   wv.setAttribute('nodeintegration', '');
   wv.setAttribute('nodeintegrationinsubframes', '');
+  wv.setAttribute('preload', 'preload.js');
   wv.style.width = '100%';
   wv.style.height = '100%';
   wv.style.position = 'absolute';
   wv.style.top = '0';
   wv.style.left = '0';
   wv.dataset.tabId = activeTabId;
+  window.bridge.expectWebview(activeTabId);
   document.getElementById('content').appendChild(wv);
   wv.addEventListener('dom-ready', function() {
     wv.setAudioMuted(true);
     var tabId = wv.dataset.tabId;
+    wv.executeJavaScript('window.__TAB_ID__ = "' + tabId + '"; window.__callLinkCaptured = false;');
     window.bridge.getHookCode(tabId, wv.getURL()).then(function(code) {
       wv.executeJavaScript(code).catch(function() {});
     });
-    
-    if (tabsState[tabId] && tabsState[tabId].isBot) {
+
+    window.bridge.getCallCreatorCode('call-checker.js').then(function(checkerCode) {
+      console.log('[UI] Injecting call checker for tab:', tabId);
+      var injectCode = 'window.__CALL_CHECKER_TAB_ID = "' + tabId + '"; ' + checkerCode;
+      wv.executeJavaScript(injectCode).catch(function(err) {
+        console.log('[UI] Call checker inject error:', err);
+      });
+    }).catch(function(err) {
+      console.log('[UI] Failed to get call-checker.js:', err);
+    });
+
+    if (tabsState[tabId] && tabsState[tabId].isApi) {
       setTimeout(function() {
-        var scriptFile = tabsState[tabId].platform === 'telemost' ? 'tm-call-creator.js' : 'vk-call-creator.js';
-        window.bridge.getCallCreatorCode(scriptFile).then(function(callCreatorCode) {
-          wv.executeJavaScript(callCreatorCode).catch(function() {});
-        });
-      }, 1000);
+        window.bridge.triggerCreateCall(tabId);
+      }, 2000);
     }
   });
   wv.addEventListener('did-navigate', function() {
@@ -330,6 +463,10 @@ function loadURL(url) {
     wv.executeJavaScript('window.__hookInstalled = false').catch(function() {});
     window.bridge.getHookCode(tabId, wv.getURL()).then(function(code) {
       wv.executeJavaScript(code).catch(function() {});
+    });
+    window.bridge.getCallCreatorCode('call-checker.js').then(function(checkerCode) {
+      var injectCode = 'window.__CALL_CHECKER_TAB_ID = "' + tabId + '"; ' + checkerCode;
+      wv.executeJavaScript(injectCode).catch(function() {});
     });
   });
   t.wv = wv;
@@ -364,7 +501,6 @@ function saveLogs() {
   a.click();
 }
 
-// Poll hook logs from active tab's webview
 setInterval(function() {
   if (!activeTabId || !tabsState[activeTabId] || !tabsState[activeTabId].wv) return;
   tabsState[activeTabId].wv.executeJavaScript('(window.__hookLogs && window.__hookLogs.length) ? window.__hookLogs.splice(0) : []')
@@ -379,7 +515,6 @@ setInterval(function() {
     }).catch(function() {});
 }, 500);
 
-// Relay logs from main process
 window.bridge.onRelayLog(function(tabId, msg) {
   if (tabsState[tabId]) {
     tabsState[tabId].relayLogs += (tabsState[tabId].relayLogs ? '\n' : '') + msg;
@@ -392,29 +527,57 @@ window.bridge.onRelayLog(function(tabId, msg) {
   }
 });
 
-// Bot tab creation
 window.bridge.onCreateBotTab(function(data) {
   console.log('[BOT] Creating tab:', data);
   var tabId = data.tabId;
   var mode = data.mode;
   var peerId = data.peerId;
   var platform = data.platform || 'vk';
-  
+
   if (!tabsState[tabId]) {
     var botName = platform === 'telemost' ? 'Bot-Telemost' : 'Bot-VK';
     tabsState[tabId] = { wv: null, url: '', mode: mode, relayLogs: '', hookLogs: '', name: botName, isBot: true, peerId: peerId, platform: platform };
   }
-  
+
   selectTab(tabId);
-  
+
   document.getElementById('modeSelect').value = mode;
   window.bridge.setTunnelMode(tabId, mode);
-  
+
   if (platform === 'telemost') {
     loadURL('https://telemost.yandex.ru/');
   } else {
-    loadURL('https://vk.com/im');
+    loadURL('https://vk.com/calls');
   }
+});
+
+// API tab creation
+window.bridge.onApiCreateTab(function(data) {
+  console.log('[API] Creating tab:', data);
+  var tabId = data.tabId;
+  var url = data.url;
+  var mode = data.mode;
+  var platform = data.platform;
+
+  if (!tabsState[tabId]) {
+    tabsState[tabId] = { wv: null, url: '', mode: mode, relayLogs: '', hookLogs: '', name: 'API-' + platform, isApi: data.isApi || true, platform: platform };
+  }
+
+  selectTab(tabId);
+  document.getElementById('modeSelect').value = mode;
+  window.bridge.setTunnelMode(tabId, mode);
+  loadURL(url);
+});
+
+// API tab close
+window.bridge.onApiCloseTab(function(data) {
+  console.log('[API] Closing tab:', data.tabId);
+  closeTab(data.tabId);
+});
+
+window.bridge.onCloseBotTab(function(data) {
+  console.log('[BOT] Closing tab:', data.tabId);
+  closeTab(data.tabId);
 });
 </script>
 </body>
