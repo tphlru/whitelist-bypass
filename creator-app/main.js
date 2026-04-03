@@ -2,30 +2,64 @@ const { app, BrowserWindow, session, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const http = require('http');
 const TelemostAutoclick = require('./telemost-autoclick');
 const VkAutoclick = require('./vk-autoclick');
 const BotManager = require('./bot-manager');
 
-var hooksDir = app.isPackaged
-  ? path.join(process.resourcesPath, 'hooks')
-  : path.join(__dirname, '..', 'hooks');
-var logCapture = "if(!window.__logCaptureInstalled){window.__logCaptureInstalled=true;window.__hookLogs=[];var _ol=console.log.bind(console);console.log=function(){_ol.apply(null,arguments);var m=Array.prototype.slice.call(arguments).join(' ');if(m.indexOf('[HOOK]')!==-1)window.__hookLogs.push(m)}}";
-var relayPath = app.isPackaged
-  ? path.join(process.resourcesPath, process.platform === 'win32' ? 'relay.exe' : 'relay')
-  : path.join(__dirname, '..', 'relay', process.platform === 'win32' ? 'relay.exe' : 'relay');
-var headlessPath = app.isPackaged
-  ? path.join(process.resourcesPath, process.platform === 'win32' ? 'headless-creator.exe' : 'headless-creator')
-  : path.join(__dirname, '..', 'headless', process.platform === 'win32' ? 'headless-creator.exe' : 'headless-creator');
-var headlessPath = app.isPackaged
-  ? path.join(process.resourcesPath, process.platform === 'win32' ? 'headless-creator.exe' : 'headless-creator')
-  : path.join(__dirname, '..', 'headless', process.platform === 'win32' ? 'headless-creator.exe' : 'headless-creator');
-
+var appVersion;
+if (app.isPackaged) {
+  appVersion = app.getVersion();
+} else {
+  appVersion = require('./package.json').version;
+}
+var hooksDir;
+if (app.isPackaged) {
+  hooksDir = path.join(process.resourcesPath, 'hooks');
+} else {
+  hooksDir = path.join(__dirname, '..', 'hooks');
+}
+var relayPath;
+if (app.isPackaged) {
+  if (process.platform === 'win32') {
+    relayPath = path.join(process.resourcesPath, 'relay.exe');
+  } else {
+    relayPath = path.join(process.resourcesPath, 'relay');
+  }
+} else {
+  if (process.platform === 'win32') {
+    relayPath = path.join(__dirname, '..', 'relay', 'relay.exe');
+  } else {
+    relayPath = path.join(__dirname, '..', 'relay', 'relay');
+  }
+}
+var headlessPath;
+if (app.isPackaged) {
+  if (process.platform === 'win32') {
+    headlessPath = path.join(process.resourcesPath, 'headless-creator.exe');
+  } else {
+    headlessPath = path.join(process.resourcesPath, 'headless-creator');
+  }
+} else {
+  if (process.platform === 'win32') {
+    headlessPath = path.join(__dirname, '..', 'headless', 'headless-creator.exe');
+  } else {
+    headlessPath = path.join(__dirname, '..', 'headless', 'headless-creator');
+  }
+}
+var logCapture = "...";
 var tabs = new Map(); // tabId -> { relay, tunnelMode, platform, dcPort, pionPort, isBot }
+var callStatusCache = new Map();
+var nextPortBase = 10000;
+
 var callStatusCache = new Map();
 var nextPortBase = 10000;
 var mainWindow = null;
 var botManager = null;
-var botTabs = new Set();
+var autoclickEnabled = true;
+var autoclickers = new Map();
+var tabToWebview = new Map();
+var pendingWebviewTabId = null;
 
 function isPortFree(port) {
   return new Promise(function(resolve) {
@@ -101,6 +135,7 @@ function startRelay(tab) {
     data.toString().trim().split('\n').forEach(function(msg) {
       if (!msg) return;
       console.log('[relay:' + tabId + ']', msg);
+      tab.relayLogs = (tab.relayLogs || '') + (tab.relayLogs ? '\n' : '') + msg;
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('relay-log', { tabId: tabId, msg: msg });
       }
@@ -160,88 +195,103 @@ function createWindow() {
   mainWindow.loadFile('index.html');
   mainWindow.on('closed', function() { mainWindow = null; });
 
-  var autoclickers = new Map(); // tabId -> { telemost, vk }
-
   mainWindow.webContents.on('did-attach-webview', function(e, wvContents) {
-    wvContents.on('before-input-event', function(e, input) {
+    wvContents.setMaxListeners(Infinity);
+    var wvId = wvContents.id;
+    var wvListeners = {};
+    
+    if (pendingWebviewTabId !== null) {
+      tabToWebview.set(pendingWebviewTabId, wvId);
+      pendingWebviewTabId = null;
+    }
+    
+    wvListeners.beforeInput = function(e, input) {
       if (input.key === 'F12') wvContents.openDevTools();
-    });
-    wvContents.on('did-navigate', function(e, url) {
-      var tabId = wvContents.id;
-      if (!autoclickers.has(tabId)) {
-        autoclickers.set(tabId, { telemost: new TelemostAutoclick(), vk: new VkAutoclick() });
+    };
+    wvContents.on('before-input-event', wvListeners.beforeInput);
+    
+    wvListeners.didNavigate = function(e, url) {
+      if (!autoclickers.has(wvId)) {
+        autoclickers.set(wvId, { telemost: new TelemostAutoclick(), vk: new VkAutoclick() });
       }
-      var ac = autoclickers.get(tabId);
+      var ac = autoclickers.get(wvId);
+      if (!autoclickEnabled) {
+        ac.telemost.stop();
+        ac.vk.stop();
+        return;
+      }
+      
+      var tabId = null;
+      tabToWebview.forEach(function(v, k) { if (v === wvId) tabId = k; });
+      var tab = tabId ? tabs.get(tabId) : null;
+      var isBotTab = tab && tab.isBot === true;
+      
       if (url.includes('telemost.yandex')) {
         ac.vk.stop();
-        ac.telemost.attach(wvContents);
+        ac.telemost.attach(wvContents, isBotTab);
+        startCallLinkPolling(wvContents, tabId, 'telemost');
       } else if (url.includes('vk.com')) {
         ac.telemost.stop();
-        ac.vk.attach(wvContents);
+        ac.vk.attach(wvContents, isBotTab);
+        startCallLinkPolling(wvContents, tabId, 'vk');
       } else {
         ac.telemost.stop();
         ac.vk.stop();
       }
-    });
-    wvContents.on('console-message', function(e, level, msg) {
+    };
+    wvContents.on('did-navigate', wvListeners.didNavigate);
+    
+    function startCallLinkPolling(wvContents, tabId, platform) {
+      if (!tabId) return;
+      
+      var pollInterval = setInterval(function() {
+        if (!wvContents || wvContents.isDestroyed()) {
+          clearInterval(pollInterval);
+          return;
+        }
+        var tab = tabs.get(tabId);
+        if (tab && tab.callLink) {
+          clearInterval(pollInterval);
+          return;
+        }
+        var script;
+        if (platform === 'vk') {
+          script = "try{var s=Calls?.store?.getState?.();var l=s?.join?.joinLink;if(l)window.bridge.onCallLinkCaptured('" + tabId + "','https://vk.com/call/join/'+l)}catch(e){}";
+        } else {
+          script = "try{var u=window.location.href;if(u.includes('/j/')||u.includes('/join/'))window.bridge.onCallLinkCaptured('" + tabId + "',u)}catch(e){}";
+        }
+        wvContents.executeJavaScript(script).catch(function() {});
+      }, 1000);
+    }
+    
+    wvListeners.consoleMsg = function(e, level, msg) {
       if (msg.indexOf('state: disconnected') !== -1 || msg.indexOf('state: failed') !== -1) {
         var ac = autoclickers.get(wvContents.id);
         if (ac) ac.vk.kickDisconnected();
       }
-      if (msg.indexOf('[BOT] VKCalls: call link:') !== -1) {
-        var link = msg.split('[BOT] VKCalls: call link:')[1].trim();
-        console.log('[MAIN] VK call link captured:', link);
-
-        var foundPeerId = null;
-        tabs.forEach(function(t, id) {
-          if (botTabs.has(id) && t.platform === 'vk') {
-            foundPeerId = t.peerId;
-          }
-        });
-
-        if (foundPeerId && botManager) {
-          console.log('[MAIN] Sending VK link to peer:', foundPeerId);
-          botManager.sendMessage(foundPeerId, 'Call created!\n ' + link);
+      if (msg.indexOf('[CALL_STATUS]') !== -1 && msg.indexOf(':') !== -1) {
+        var parts = msg.split('[CALL_STATUS] ')[1];
+        var colonIndex = parts.indexOf(':');
+        if (colonIndex !== -1) {
+          var tabId = parts.substring(0, colonIndex);
+          var status = parts.substring(colonIndex + 1);
+          callStatusCache.set(tabId, status);
         }
       }
-
-      if (msg.indexOf('[BOT] Telemost: call link:') !== -1) {
-        var link = msg.split('[BOT] Telemost: call link:')[1].trim();
-        console.log('[MAIN] Telemost call link captured:', link);
-
-        var foundPeerId = null;
-        tabs.forEach(function(t, id) {
-          if (botTabs.has(id) && t.platform === 'telemost') {
-            foundPeerId = t.peerId;
-          }
-        });
-
-        if (foundPeerId && botManager) {
-          console.log('[MAIN] Sending Telemost link to peer:', foundPeerId);
-          botManager.sendMessage(foundPeerId, 'Call created!\n ' + link);
-        }
-      }
-
-      if (msg.indexOf('[CALL_STATUS]') !== -1) {
-        console.log('[MAIN] Received call status:', msg);
-        if (msg.indexOf(':') !== -1) {
-          var parts = msg.split('[CALL_STATUS] ')[1];
-          var colonIndex = parts.indexOf(':');
-          if (colonIndex !== -1) {
-            var tabId = parts.substring(0, colonIndex);
-            var status = parts.substring(colonIndex + 1);
-            callStatusCache.set(tabId, status);
-            console.log('[MAIN] Cached status for', tabId, ':', status);
-          }
-        }
-      }
-    });
-    wvContents.on('destroyed', function() {
-      var ac = autoclickers.get(wvContents.id);
-      if (ac) { ac.telemost.stop(); ac.vk.stop(); autoclickers.delete(wvContents.id); }
-      callStatusCache.forEach(function(status, tabId) {
-      });
-    });
+    };
+    wvContents.on('console-message', wvListeners.consoleMsg);
+    
+    wvListeners.destroyed = function() {
+      wvContents.removeListener('before-input-event', wvListeners.beforeInput);
+      wvContents.removeListener('did-navigate', wvListeners.didNavigate);
+      wvContents.removeListener('console-message', wvListeners.consoleMsg);
+      wvContents.removeListener('destroyed', wvListeners.destroyed);
+      var wvId = wvContents.id;
+      var ac = autoclickers.get(wvId);
+      if (ac) { ac.telemost.stop(); ac.vk.stop(); autoclickers.delete(wvId); }
+      tabToWebview.forEach(function(v, k) { if (v === wvId) tabToWebview.delete(k); });
+    };
+    wvContents.on('destroyed', wvListeners.destroyed);
   });
 }
 
@@ -251,7 +301,7 @@ ipcMain.handle('get-hook-code', async function(e, tabId, url) {
 });
 
 ipcMain.handle('get-call-creator-code', function(e, scriptFile) {
-  var filePath = path.join(__dirname, scriptFile || 'vk-call-creator.js');
+  var filePath = path.join(__dirname, scriptFile || 'call-checker.js');
   return fs.readFileSync(filePath, 'utf8');
 });
 
@@ -306,8 +356,8 @@ ipcMain.handle('close-tab', function(e, tabId) {
   if (tab) {
     killRelay(tab);
     tabs.delete(tabId);
+    callStatusCache.delete(tabId);
   }
-  botTabs.delete(tabId);
 });
 
 // Bot IPC
@@ -321,7 +371,6 @@ ipcMain.handle('start-bot', function(e, settings) {
     var tabId = 'bot-tab-' + Date.now();
     var ports = await allocPorts();
     tabs.set(tabId, { relay: null, tunnelMode: tabConfig.mode, platform: tabConfig.platform || 'vk', dcPort: ports.dc, pionPort: ports.pion, peerId: tabConfig.peerId, isBot: true });
-    botTabs.add(tabId);
 
     mainWindow.webContents.send('create-bot-tab', { tabId: tabId, mode: tabConfig.mode, peerId: tabConfig.peerId, platform: tabConfig.platform || 'vk' });
     console.log('[BOT] Created tab:', tabId, 'mode:', tabConfig.mode, 'platform:', tabConfig.platform, 'peerId:', tabConfig.peerId);
@@ -333,6 +382,7 @@ ipcMain.handle('start-bot', function(e, settings) {
         platform: tab.platform, 
         mode: tab.tunnelMode, 
         isBot: tab.isBot === true,
+        isApi: tab.isApi === true,
         callStatus: callStatusCache.get(tabId) || 'inactive'
       });
     });
@@ -342,7 +392,6 @@ ipcMain.handle('start-bot', function(e, settings) {
     if (tab) {
       killRelay(tab);
       tabs.delete(tabId);
-      botTabs.delete(tabId);
       callStatusCache.delete(tabId);
       console.log('[BOT] Closed tab:', tabId);
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -367,18 +416,279 @@ ipcMain.handle('stop-bot', function() {
   return { success: true };
 });
 
+ipcMain.on('set-autoclick-enabled', function(e, enabled) {
+  autoclickEnabled = enabled;
+  console.log('[MAIN] Autoclick enabled:', enabled);
+});
+
+ipcMain.on('expect-webview', function(e, tabId) {
+  pendingWebviewTabId = tabId;
+});
+
+ipcMain.on('trigger-create-call', function(e, tabId) {
+  var wvId = tabToWebview.get(tabId);
+  if (!wvId) return;
+  var ac = autoclickers.get(wvId);
+  if (!ac) return;
+  var tab = tabs.get(tabId);
+  if (!tab) return;
+  if (tab.platform === 'telemost') {
+    ac.telemost.clickCreateCall();
+  } else {
+    ac.vk.clickCreateCall();
+  }
+});
+
+ipcMain.on('call-link-captured', async function(e, tabId, link) {
+  var tab = tabs.get(tabId);
+  if (tab) {
+    tab.callLink = link;
+    console.log('[CALL_LINK] Captured:', link);
+    
+    if (tab.isBot && tab.peerId && botManager) {
+      await botManager.sendMessage(tab.peerId, '🔗 Call link: ' + link);
+    }
+  }
+});
+
+// HTTP API Server
+var apiEnabled = true;
+var apiPort = parseInt(process.env.CREATOR_API_PORT) || 8080;
+var apiKey = process.env.CREATOR_API_KEY || '';
+var apiUseSecret = false;
+var apiServer = null;
+
+ipcMain.handle('get-env-vars', function() {
+  return {
+    apiPort: process.env.CREATOR_API_PORT || '',
+    apiKey: process.env.CREATOR_API_KEY || ''
+  };
+});
+
+function parseBody(req) {
+  return new Promise(function(resolve, reject) {
+    var body = '';
+    req.on('data', function(chunk) { body += chunk; });
+    req.on('end', function() {
+      try { resolve(body ? JSON.parse(body) : {}); }
+      catch (e) { reject(new Error('Invalid JSON')); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res, status, data) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+  });
+  res.end(JSON.stringify(data));
+}
+
+function checkAuth(req) {
+  if (!apiUseSecret) return true;
+  if (!apiKey) return true;
+  var auth = req.headers['authorization'] || '';
+  if (auth === 'Bearer ' + apiKey || auth === apiKey) return true;
+  return false;
+}
+
+async function handleApi(req, res) {
+  var url = req.url.split('?')[0];
+  var method = req.method;
+
+  if (method === 'OPTIONS') {
+    sendJson(res, 200, {});
+    return;
+  }
+
+  if (!checkAuth(req)) {
+    sendJson(res, 401, { error: 'Unauthorized. Missing or invalid API secret in Authorization header.' });
+    return;
+  }
+
+  // GET /api/health
+  if (url === '/api/health' && method === 'GET') {
+    sendJson(res, 200, { status: 'ok', version: appVersion });
+    return;
+  }
+
+  // GET /api/calls - list all calls
+  if (url === '/api/calls' && method === 'GET') {
+    var calls = [];
+    tabs.forEach(function(tab, tabId) {
+      calls.push({
+        tabId: tabId,
+        platform: tab.platform,
+        mode: tab.tunnelMode,
+        relayRunning: !!tab.relay,
+        isBot: tab.isBot === true,
+        isApi: tab.isApi === true,
+        peerId: tab.peerId || null,
+        callLink: tab.callLink || null,
+        callStatus: callStatusCache.get(tabId) || 'inactive'
+      });
+    });
+    sendJson(res, 200, { calls: calls });
+    return;
+  }
+
+  // POST /api/call/create - create new call
+  if (url === '/api/call/create' && method === 'POST') {
+    try {
+      var body = await parseBody(req);
+      var platform = body.platform || 'vk';
+      var mode = body.mode || 'dc';
+      if (['vk', 'telemost'].indexOf(platform) === -1) {
+        sendJson(res, 400, { error: 'Invalid platform. Use vk or telemost' });
+        return;
+      }
+      if (['dc', 'pion-video'].indexOf(mode) === -1) {
+        sendJson(res, 400, { error: 'Invalid mode. Use dc or pion-video' });
+        return;
+      }
+
+      var tabId = 'api-tab-' + Date.now();
+      var ports = await allocPorts();
+      tabs.set(tabId, { relay: null, tunnelMode: mode, platform: platform, dcPort: ports.dc, pionPort: ports.pion, url: '', isBot: false, isApi: true });
+      startRelay(tabs.get(tabId));
+
+      var callUrl;
+if (platform === 'telemost') {
+  callUrl = 'https://telemost.yandex.ru/';
+} else {
+  callUrl = 'https://vk.com/calls';
+}
+
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('api-create-tab', { tabId: tabId, url: callUrl, mode: mode, platform: platform, isApi: true });
+      }
+
+      sendJson(res, 200, { tabId: tabId, url: callUrl, platform: platform, mode: mode });
+    } catch (e) {
+      sendJson(res, 500, { error: e.message });
+    }
+    return;
+  }
+
+  // POST /api/call/join - join existing call by URL
+  if (url === '/api/call/join' && method === 'POST') {
+    try {
+      var body = await parseBody(req);
+      var callUrl = body.url;
+      var mode = body.mode || 'dc';
+
+      if (!callUrl) {
+        sendJson(res, 400, { error: 'Missing url' });
+        return;
+      }
+      if (['dc', 'pion-video'].indexOf(mode) === -1) {
+        sendJson(res, 400, { error: 'Invalid mode. Use dc or pion-video' });
+        return;
+      }
+
+      var platform = callUrl.includes('telemost.yandex') ? 'telemost' : 'vk';
+
+      var tabId = 'api-tab-' + Date.now();
+      var ports = await allocPorts();
+      tabs.set(tabId, { relay: null, tunnelMode: mode, platform: platform, dcPort: ports.dc, pionPort: ports.pion, url: callUrl, isBot: false, isApi: true });
+      startRelay(tabs.get(tabId));
+
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('api-create-tab', { tabId: tabId, url: callUrl, mode: mode, platform: platform, isApi: true });
+      }
+
+      sendJson(res, 200, { tabId: tabId, url: callUrl, platform: platform, mode: mode });
+    } catch (e) {
+      sendJson(res, 500, { error: e.message });
+    }
+    return;
+  }
+
+  // DELETE /api/call/:tabId - close call
+  var closeMatch = url.match(/^\/api\/call\/([^/]+)$/);
+  if (closeMatch && method === 'DELETE') {
+    var tabId = closeMatch[1];
+    var tab = tabs.get(tabId);
+    if (!tab) {
+      sendJson(res, 404, { error: 'Tab not found' });
+      return;
+    }
+    killRelay(tab);
+    tabs.delete(tabId);
+    callStatusCache.delete(tabId);
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('api-close-tab', { tabId: tabId });
+    }
+
+    sendJson(res, 200, { success: true });
+    return;
+  }
+
+  // GET /api/call/:tabId/logs - get logs
+  var logsMatch = url.match(/^\/api\/call\/([^/]+)\/logs$/);
+  if (logsMatch && method === 'GET') {
+    var tabId = logsMatch[1];
+    var tab = tabs.get(tabId);
+    if (!tab) {
+      sendJson(res, 404, { error: 'Tab not found' });
+      return;
+    }
+    sendJson(res, 200, { relayLogs: tab.relayLogs || '' });
+    return;
+  }
+
+  sendJson(res, 404, { error: 'Not found' });
+}
+
+function startApiServer() {
+  if (apiServer) {
+    apiServer.close();
+    apiServer = null;
+  }
+  if (!apiEnabled) {
+    console.log('[API] Server disabled');
+    return;
+  }
+  apiServer = http.createServer(handleApi);
+  apiServer.listen(apiPort, function() {
+    console.log('[API] Server running on port', apiPort);
+    if (apiUseSecret && apiKey) {
+      console.log('[API] API secret required for access');
+    } else {
+      console.log('[API] No secret required - open access');
+    }
+  });
+}
+
+ipcMain.on('set-api-settings', function(e, enabled, port, secret, useSecret) {
+  var needRestart = (enabled !== apiEnabled) || (port !== apiPort);
+  apiEnabled = enabled;
+  apiPort = port;
+  apiKey = secret;
+  apiUseSecret = useSecret;
+  console.log('[MAIN] API settings updated - enabled:', apiEnabled, 'port:', apiPort, 'useSecret:', apiUseSecret);
+  if (needRestart) {
+    startApiServer();
+  }
+});
+
 ipcMain.handle('get-cookies', async function(e, domain) {
   var ses = session.fromPartition('persist:creator');
   var all = await ses.cookies.get({});
   var vkCookies = all.filter(function(c) {
     return c.domain && (c.domain.indexOf('vk.com') !== -1 || c.domain.indexOf('vk.ru') !== -1);
   });
-  console.log('[COOKIES] total:', all.length, 'vk:', vkCookies.length);
+  console.log('[COOKIES] total:', all.length, 'vk:', vkCookies.length); // ← добавить
   return vkCookies;
 });
-
-
-app.whenReady().then(createWindow);
+app.whenReady().then(function() {
+  createWindow();
+  startApiServer();
+});
 
 app.on('window-all-closed', function() { killAllRelays(); app.quit(); });
 app.on('before-quit', killAllRelays);

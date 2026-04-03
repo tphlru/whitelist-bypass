@@ -13,5 +13,15 @@ contextBridge.exposeInMainWorld('bridge', {
   onBotError: function(cb) { ipcRenderer.on('bot-error', function(e, msg) { cb(msg); }); },
   getCookies: function(domain) { return ipcRenderer.invoke('get-cookies', domain); },
   startHeadless: function(tabId) { return ipcRenderer.invoke('start-headless', tabId); },
-  onCloseBotTab: function(cb) { ipcRenderer.on('close-bot-tab', function(e, data) { cb(data); }); }
+  onCloseBotTab: function(cb) { ipcRenderer.on('close-bot-tab', function(e, data) { cb(data); }); },
+  setAutoclickEnabled: function(enabled) { ipcRenderer.send('set-autoclick-enabled', enabled); },
+  onApiCreateTab: function(cb) { ipcRenderer.on('api-create-tab', function(e, data) { cb(data); }); },
+  onApiCloseTab: function(cb) { ipcRenderer.on('api-close-tab', function(e, data) { cb(data); }); },
+  setApiSettings: function(enabled, port, secret, useSecret) { ipcRenderer.send('set-api-settings', enabled, port, secret, useSecret); },
+  getCookies: function(domain) { return ipcRenderer.invoke('get-cookies', domain); },
+  onCloseBotTab: function(cb) { ipcRenderer.on('close-bot-tab', function(e, data) { cb(data); }); },
+  triggerCreateCall: function(tabId) { ipcRenderer.send('trigger-create-call', tabId); },
+  expectWebview: function(tabId) { ipcRenderer.send('expect-webview', tabId); },
+  onCallLinkCaptured: function(tabId, link) { ipcRenderer.send('call-link-captured', tabId, link); },
+  getEnvVars: function() { return ipcRenderer.invoke('get-env-vars'); }
 });

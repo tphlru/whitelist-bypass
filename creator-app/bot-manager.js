@@ -101,7 +101,7 @@ class BotManager {
     try {
       await this.getLongPollServer();
       console.log('[BOT] LongPoll server:', this.server);
-      this.pollLoop();
+      this.pollLoop().catch(err => console.error('[BOT] PollLoop error:', err.message));
     } catch (err) {
       console.error('[BOT] Failed to start:', err.message);
       this.running = false;
