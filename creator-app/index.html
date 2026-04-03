@@ -56,8 +56,15 @@ body { font-family: -apple-system, sans-serif; background: #1a1a1a; color: #e0e0
 </style>
 </head>
 <body>
-<div class="tab-bar" id="tabBar">
-  <div class="tab-add" onclick="addTab()" title="New tab">+</div>
+<div class="tab-bar">
+  <div class="tab-bar-tabs" id="tabBar">
+    <div class="tab-add" onclick="addTab()" title="New tab">+</div>
+  </div>
+  <div class="tab-bar-actions">
+    <div class="tab-settings" onclick="copyCookies()" title="Export VK cookies to cookies.json for headless mode" style="cursor:pointer">Export Cookies</div>
+    <div class="tab-settings" onclick="openSettings()" title="Settings">Settings</div>
+    <div class="tab-bot" id="tabBot" onclick="toggleBot()">Bot: Off</div>
+  </div>
 </div>
 <div class="toolbar" id="toolbar" style="display:none">
   <button class="btn-vk" onclick="loadURL('https://vk.com/im')">VK</button>
@@ -124,9 +131,92 @@ body { font-family: -apple-system, sans-serif; background: #1a1a1a; color: #e0e0
   </div>
 </div>
 <script>
+function showError(msg) {
+  document.getElementById('errorText').textContent = msg;
+  document.getElementById('errorPopup').classList.add('visible');
+}
+function closeError() {
+  document.getElementById('errorPopup').classList.remove('visible');
+}
+
 var tabsState = {}; // tabId -> { wv, mode, relayLogs, hookLogs }
 var activeTabId = null;
 var nextTabId = 1;
+var botRunning = false;
+
+var savedSettings = localStorage.getItem('botSettings');
+var botSettings = savedSettings ? JSON.parse(savedSettings) : { token: '', groupId: '', userId: '' };
+
+if (localStorage.getItem('botEnabled') === 'true' && botSettings.token && botSettings.groupId) {
+  botRunning = true;
+  var btn = document.getElementById('tabBot');
+  btn.textContent = 'Bot: On';
+  btn.classList.add('running');
+  window.bridge.startBot(botSettings);
+}
+
+window.bridge.onBotError(function(msg) {
+  showError(msg);
+  botRunning = false;
+  localStorage.setItem('botEnabled', 'false');
+  var btn = document.getElementById('tabBot');
+  btn.textContent = 'Bot: Off';
+  btn.classList.remove('running');
+});
+
+function copyCookies() {
+  window.bridge.getCookies('.vk.com').then(function(cookies) {
+    if (!cookies.length) {
+      showError('No VK cookies found.\nPlease log into VK first.');
+      return;
+    }
+    var simple = cookies.map(function(c) { return { name: c.name, value: c.value }; });
+    var blob = new Blob([JSON.stringify(simple, null, 2)], { type: 'application/json' });
+    var link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'cookies.json';
+    link.click();
+  });
+}
+
+function openSettings() {
+  document.getElementById('settingsPopup').classList.add('visible');
+  document.getElementById('vkToken').value = botSettings.token;
+  document.getElementById('vkGroupId').value = botSettings.groupId;
+  document.getElementById('vkUserId').value = botSettings.userId;
+}
+
+function closeSettings() {
+  document.getElementById('settingsPopup').classList.remove('visible');
+}
+
+function saveSettings() {
+  botSettings.token = document.getElementById('vkToken').value.trim();
+  botSettings.groupId = document.getElementById('vkGroupId').value.trim();
+  botSettings.userId = document.getElementById('vkUserId').value.trim();
+  localStorage.setItem('botSettings', JSON.stringify(botSettings));
+  closeSettings();
+  console.log('[BOT] Settings saved:', botSettings);
+}
+
+function toggleBot() {
+  if (!botSettings.token || !botSettings.groupId) {
+    openSettings();
+    return;
+  }
+  botRunning = !botRunning;
+  localStorage.setItem('botEnabled', botRunning ? 'true' : 'false');
+  var btn = document.getElementById('tabBot');
+  if (botRunning) {
+    btn.textContent = 'Bot: On';
+    btn.classList.add('running');
+    window.bridge.startBot(botSettings);
+  } else {
+    btn.textContent = 'Bot: Off';
+    btn.classList.remove('running');
+    window.bridge.stopBot();
+  }
+}
 
 function addTab() {
   var tabId = 'tab-' + (nextTabId++);
@@ -377,6 +467,70 @@ window.bridge.onRelayLog(function(tabId, msg) {
     el.textContent += msg;
     el.scrollTop = el.scrollHeight;
   }
+});
+
+function parseHeadlessLog(tabId, msg) {
+  var t = tabsState[tabId];
+  if (!t) return;
+  var trimmed = msg.trim();
+  if (trimmed === 'CALL CREATED') {
+    t.callInfo = {};
+    t.headlessStatus = 'Call created';
+  }
+  if (trimmed.indexOf('join_link:') !== -1) {
+    if (!t.callInfo) t.callInfo = {};
+    t.callInfo.joinLink = trimmed.split('join_link:')[1].trim();
+  }
+  if (trimmed.indexOf('short:') !== -1) {
+    if (!t.callInfo) t.callInfo = {};
+    t.callInfo.shortLink = trimmed.split('short:')[1].trim();
+  }
+  if (trimmed.indexOf('TURN:') !== -1) {
+    if (!t.callInfo) t.callInfo = {};
+    t.callInfo.turn = trimmed.split('TURN:')[1].trim();
+  }
+  if (trimmed.indexOf('protocol:') !== -1) {
+    if (!t.callInfo) t.callInfo = {};
+    t.callInfo.protocol = trimmed.split('protocol:')[1].trim();
+  }
+  if (trimmed === 'TUNNEL CONNECTED') {
+    t.tunnelConnected = true;
+    t.headlessStatus = 'Tunnel connected';
+  }
+  if (tabId === activeTabId) renderContent();
+}
+
+function copyToClipboard(text) {
+  navigator.clipboard.writeText(text);
+}
+
+window.bridge.onCreateBotTab(function(data) {
+  console.log('[BOT] Creating tab:', data);
+  var tabId = data.tabId;
+  var mode = data.mode;
+  var peerId = data.peerId;
+  var platform = data.platform || 'vk';
+
+  if (!tabsState[tabId]) {
+    var botName = platform === 'telemost' ? 'Bot-Telemost' : 'Bot-VK';
+    tabsState[tabId] = { wv: null, url: '', mode: mode, relayLogs: '', hookLogs: '', name: botName, isBot: true, peerId: peerId, platform: platform };
+  }
+
+  selectTab(tabId);
+
+  document.getElementById('modeSelect').value = mode;
+  window.bridge.setTunnelMode(tabId, mode);
+
+  if (platform === 'telemost') {
+    loadURL('https://telemost.yandex.ru/');
+  } else {
+    loadURL('https://vk.com/im');
+  }
+});
+
+window.bridge.onCloseBotTab(function(data) {
+  console.log('[BOT] Closing tab:', data.tabId);
+  closeTab(data.tabId);
 });
 </script>
 </body>
